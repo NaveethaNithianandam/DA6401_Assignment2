@@ -63,4 +63,6 @@ Overall, the results demonstrate that Cross-Entropy, when combined with a strong
 ## 1.4. Multi-Task Output
 <img width="1630" height="587" alt="OP_asg2" src="https://github.com/user-attachments/assets/b00efcc1-4d9d-4508-a535-eb96166295e8" />
 
-W&B Report : https://wandb.ai/da25d005-indian-institute-of-technology-madras/da6401_a2/reports/Untitled-Report--VmlldzoxNjQ0NTMyMA?accessToken=kclh42cxpk1ehyapt6o318jex7tb9b8zkuk04arr2fqeqrn5ufq3nf54aumka7l9
+## W&B Report : https://wandb.ai/da25d005-indian-institute-of-technology-madras/da6401_a2/reports/Untitled-Report--VmlldzoxNjQ0NTMyMA?accessToken=kclh42cxpk1ehyapt6o318jex7tb9b8zkuk04arr2fqeqrn5ufq3nf54aumka7l9
+
+## GitHub Link : https://github.com/NaveethaNithianandam/DA6401_Assignment2/tree/main
