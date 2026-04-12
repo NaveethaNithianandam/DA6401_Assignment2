@@ -14,9 +14,12 @@ from albumentations.pytorch import ToTensorV2
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
-IMAGE_SIZE    = 224   
+IMAGE_SIZE    = 224   # fixed per VGG11 paper
 
 
+# =============================================================================
+#  Classification transforms  (spatial augmentation is fine here)
+# =============================================================================
 
 def get_cls_train_transforms() -> A.Compose:
     """Aggressive spatial + colour augmentation for classification.
@@ -25,7 +28,7 @@ def get_cls_train_transforms() -> A.Compose:
     depend on where in the image the crop is taken.
     """
     return A.Compose([
-        A.RandomResizedCrop(size=(IMAGE_SIZE, IMAGE_SIZE),
+        A.RandomResizedCrop(height=IMAGE_SIZE, width=IMAGE_SIZE,
                             scale=(0.6, 1.0), ratio=(0.75, 1.33), p=1.0),
         A.HorizontalFlip(p=0.5),
         A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.08, p=0.6),
@@ -45,6 +48,19 @@ def get_cls_val_transforms() -> A.Compose:
         ToTensorV2(),
     ])
 
+
+# =============================================================================
+#  Localization transforms  (NO spatial crops / rotations)
+#
+#  Root cause of the original train/val mismatch:
+#  RandomResizedCrop shifts bbox coordinates relative to the random crop
+#  window.  At val time (simple Resize) the coordinates follow a completely
+#  different distribution, causing val_MSE >> train_MSE (~4800 vs ~200).
+#
+#  Fix: use only colour augmentation + HorizontalFlip (which albumentations
+#  tracks correctly through bbox_params) during localization training.
+#  Spatial crops/rotates are removed entirely.
+# =============================================================================
 
 def get_loc_train_transforms() -> A.Compose:
     """Colour-only augmentation for localization training.
@@ -76,19 +92,19 @@ def get_loc_val_transforms() -> A.Compose:
                                 min_visibility=0.3))
 
 
+# =============================================================================
+#  Segmentation transforms
+# =============================================================================
+
 def get_seg_train_transforms() -> A.Compose:
-    """Spatial + colour augmentation for segmentation.
-    additional_targets ensures the mask receives identical spatial transforms.
-    """
     return A.Compose([
-        A.RandomResizedCrop(size=(IMAGE_SIZE, IMAGE_SIZE),
+        A.RandomResizedCrop(height=IMAGE_SIZE, width=IMAGE_SIZE,
                             scale=(0.7, 1.0), ratio=(0.75, 1.33), p=1.0),
         A.HorizontalFlip(p=0.5),
         A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.5),
-        A.GaussianBlur(blur_limit=(3, 5), p=0.15),
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ToTensorV2(),
-    ], additional_targets={'mask': 'mask'})
+    ])
 
 
 def get_seg_val_transforms() -> A.Compose:
@@ -96,7 +112,13 @@ def get_seg_val_transforms() -> A.Compose:
         A.Resize(IMAGE_SIZE, IMAGE_SIZE),
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ToTensorV2(),
-    ], additional_targets={'mask': 'mask'})
+    ])
+
+
+# =============================================================================
+#  Dataset
+# =============================================================================
+
 class OxfordPetsDataset(Dataset):
     """Oxford-IIIT Pet Dataset.
 
@@ -165,6 +187,7 @@ class OxfordPetsDataset(Dataset):
             self.root / "images" / f"{img_name}.jpg").convert('RGB'))
         orig_h, orig_w = image.shape[:2]
 
+        # ── Classification ───────────────────────────────────────────────────
         if self.task == "classification":
             if self.transforms is not None:
                 image = self.transforms(image=image)['image']
@@ -172,13 +195,16 @@ class OxfordPetsDataset(Dataset):
                 image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
             return image, torch.tensor(label, dtype=torch.long)
 
+        # ── Localization ─────────────────────────────────────────────────────
         elif self.task == "localization":
             bbox = self._load_bbox_xyxy(img_name)
             if bbox is None:
+                # Fallback: full image as bbox
                 xmin, ymin, xmax, ymax = 0.0, 0.0, float(orig_w), float(orig_h)
             else:
                 xmin, ymin, xmax, ymax = bbox
 
+            # Clamp to image bounds
             xmin = max(0.0, min(xmin, orig_w - 1))
             ymin = max(0.0, min(ymin, orig_h - 1))
             xmax = max(xmin + 1, min(xmax, orig_w))
@@ -189,20 +215,23 @@ class OxfordPetsDataset(Dataset):
             if self.transforms is not None:
                 out = self.transforms(
                     image=image,
-                    bboxes=[[xmin, ymin, bw, bh]],  
+                    bboxes=[[xmin, ymin, bw, bh]],  # COCO: x_min, y_min, w, h
                     bbox_labels=[label],
                 )
                 image = out['image']
                 bboxes = out['bboxes']
                 if len(bboxes) > 0:
                     xm, ym, tw, th = bboxes[0]
+                    # Convert COCO back to cx, cy, w, h (pixel space, 224x224)
                     bbox_out = torch.tensor(
                         [xm + tw / 2, ym + th / 2, tw, th], dtype=torch.float32)
                 else:
+                    # bbox was cropped out -- use image centre as fallback
                     bbox_out = torch.tensor(
                         [IMAGE_SIZE / 2, IMAGE_SIZE / 2,
                          float(IMAGE_SIZE), float(IMAGE_SIZE)], dtype=torch.float32)
             else:
+                # Scale bbox to 224x224
                 sx = IMAGE_SIZE / orig_w
                 sy = IMAGE_SIZE / orig_h
                 cx = (xmin + xmax) / 2 * sx
@@ -214,30 +243,31 @@ class OxfordPetsDataset(Dataset):
 
             return image, bbox_out
 
+        # ── Segmentation ─────────────────────────────────────────────────────
         elif self.task == "segmentation":
             mask_path = self.root / "annotations" / "trimaps" / f"{img_name}.png"
-            mask_np = (np.array(Image.open(mask_path).convert('L')) - 1).astype(np.uint8)
+            mask = np.array(Image.open(mask_path))
+            mask = (mask - 1).astype(np.int64)  # 0=fg, 1=bg, 2=uncertain
 
             if self.transforms is not None:
-                mask_rsz = np.array(
-                    Image.fromarray(mask_np).resize(
-                        (image.shape[1], image.shape[0]), Image.NEAREST))
-                out   = self.transforms(image=image, mask=mask_rsz)
-                image = out['image']          
-                mask  = out['mask'].long()    
+                image = self.transforms(image=image)['image']
             else:
-                import torch.nn.functional as F
                 image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
-                mask  = torch.from_numpy(mask_np).long()
-                mask  = F.interpolate(
-                    mask.unsqueeze(0).unsqueeze(0).float(),
-                    size=(IMAGE_SIZE, IMAGE_SIZE), mode='nearest').squeeze().long()
+
+            import torch.nn.functional as F
+            mask = torch.from_numpy(mask).long()
+            mask = F.interpolate(
+                mask.unsqueeze(0).unsqueeze(0).float(),
+                size=(IMAGE_SIZE, IMAGE_SIZE), mode='nearest').squeeze().long()
             return image, mask
 
         else:
             raise ValueError(f"Unknown task: {self.task}")
 
 
+# =============================================================================
+#  DataLoader factories
+# =============================================================================
 
 def build_classification_loaders(
     root: str, batch_size: int = 32,
@@ -275,10 +305,12 @@ def build_localization_loaders(
     full_ds = OxfordPetsDataset(root, 'trainval', 'localization', transforms=None)
     all_samples = full_ds.samples[:]
 
+    # Filter to only samples that have XML annotations
     xml_samples = [s for s in all_samples
                    if full_ds._load_bbox_xyxy(s['img_name']) is not None]
     print(f"  Localization: {len(xml_samples)}/{len(all_samples)} samples have XML annotations")
 
+    # Deterministic shuffle + split
     rng = random.Random(seed)
     rng.shuffle(xml_samples)
     n_val   = max(1, int(len(xml_samples) * val_fraction))
@@ -288,6 +320,7 @@ def build_localization_loaders(
     val_samples   = xml_samples[n_train:]
     print(f"  Split: {len(train_samples)} train / {len(val_samples)} val")
 
+    # Build datasets with correct transforms, injecting pre-filtered sample lists
     train_ds = OxfordPetsDataset(root, 'trainval', 'localization',
                                  get_loc_train_transforms())
     val_ds   = OxfordPetsDataset(root, 'trainval', 'localization',

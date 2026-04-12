@@ -29,7 +29,6 @@ import torch.optim as optim
 
 from models.classification import VGG11Classifier
 from models.localization import VGG11Localizer
-from models.segmentation import VGG11UNet
 from losses.iou_loss import IoULoss
 from data.pets_dataset import build_classification_loaders, build_localization_loaders, build_segmentation_loaders
 
@@ -40,6 +39,9 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
+# =============================================================================
+#  Device
+# =============================================================================
 
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -52,6 +54,10 @@ def get_device() -> torch.device:
 def accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     return (logits.argmax(dim=1) == labels).float().mean().item()
 
+
+# =============================================================================
+#  Checkpointing
+# =============================================================================
 
 def save_best_checkpoint(model: nn.Module, path: str):
     """Model weights only -- what the autograder loads."""
@@ -96,7 +102,9 @@ def load_resume_checkpoint(model: nn.Module, optimizer: optim.Optimizer,
     return start_epoch, best_metric, phase
 
 
-
+# =============================================================================
+#  LR schedule (two independent cosine phases, counters reset at transition)
+# =============================================================================
 
 def cosine_lr(phase_epoch: int, warmup: int, total: int,
               peak: float, min_lr: float = 1e-6) -> float:
@@ -111,7 +119,9 @@ def set_lr(optimizer: optim.Optimizer, lr: float):
         pg['lr'] = lr
 
 
-
+# =============================================================================
+#  Backbone freeze / unfreeze
+# =============================================================================
 
 def freeze_backbone(model: nn.Module, up_to: int):
     for i, layer in enumerate(model.encoder.features):
@@ -124,7 +134,9 @@ def unfreeze_all(model: nn.Module):
         p.requires_grad_(True)
 
 
-
+# =============================================================================
+#  Task 1 -- Classification
+# =============================================================================
 
 def train_classification(args):
     device = get_device()
@@ -230,7 +242,9 @@ def train_classification(args):
         wandb.finish()
 
 
-
+# =============================================================================
+#  Task 2 -- Localization
+# =============================================================================
 
 def mean_iou(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> float:
     """Compute mean IoU between predicted and target boxes (cxcywh, pixel space)."""
@@ -264,9 +278,16 @@ def train_localization(args):
 
     model = VGG11Localizer(in_channels=3, dropout_p=args.dropout_p).to(device)
 
+    # Load classification encoder weights before anything else.
+    # The encoder features from 37-class pet classification transfer directly
+    # to localization; we never update them (frozen throughout).
     model.load_encoder_from_classifier(args.classifier_ckpt, device)
     model.freeze_encoder()
 
+    # Only the regression head (12.8M params) is trained.
+    # The previous 4096x4096 head (119M params) memorised training bboxes
+    # perfectly (train_mIoU=0.73, val_mIoU=0.21 -- 3.5x gap).
+    # Tiny head + frozen encoder is the correct strategy for this dataset size.
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.phase2_lr, weight_decay=args.weight_decay,
@@ -280,15 +301,21 @@ def train_localization(args):
             model, optimizer, args.localizer_ckpt, device)
         if best_metric is None:
             best_metric = 0.0
-        model.freeze_encoder()  
+        model.freeze_encoder()  # re-freeze after state restore
         print("  Encoder re-frozen after resume.")
 
+    # Combined loss: SmoothL1 + IoU (MSE + IoU as required by assignment)
+    # SmoothL1(beta=10)/224 gives ~0.05-0.20 for typical 20-50px errors,
+    # matching IoU loss scale in [0,1]. IoU alone has zero gradient when
+    # boxes don't overlap; SmoothL1 always provides a pull signal.
+    iou_loss_fn = IoULoss(reduction="mean")
     mse_loss_fn = nn.SmoothL1Loss(beta=10.0)
     COORD_SCALE = 224.0
 
     mse_weight = args.mse_weight
     iou_weight = args.iou_weight
 
+    # Single cosine schedule over all epochs (no freeze/unfreeze phases)
     total_epochs = args.epochs
 
     if args.use_wandb and WANDB_AVAILABLE:
@@ -300,8 +327,9 @@ def train_localization(args):
                        total=total_epochs, peak=args.phase2_lr)
         set_lr(optimizer, lr)
 
+        # ── Train ───────────────────────────────────────────────────────────
         model.train()
-        model.encoder.eval()  
+        model.encoder.eval()   # keep BN stats frozen in encoder
         tr_loss = tr_mse = tr_iou_l = tr_miou = 0.0
         t0 = time.time()
 
@@ -324,6 +352,7 @@ def train_localization(args):
         n = len(train_loader)
         tr_loss /= n; tr_mse /= n; tr_iou_l /= n; tr_miou /= n
 
+        # ── Validate ────────────────────────────────────────────────────────
         model.eval()
         va_loss = va_mse = va_iou_l = va_miou = 0.0
 
@@ -367,171 +396,141 @@ def train_localization(args):
     if args.use_wandb and WANDB_AVAILABLE:
         wandb.finish()
 
-
-
-
 def train_segmentation(args):
     device = get_device()
     print(f"Device: {device}")
     pin = torch.cuda.is_available()
 
     train_loader, val_loader = build_segmentation_loaders(
-        root=args.data_root, batch_size=args.seg_batch_size,
+        root=args.data_root, batch_size=args.batch_size // 2,  # seg uses more memory
         num_workers=args.num_workers, pin_memory=pin,
     )
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
     model = VGG11UNet(num_classes=3, in_channels=3).to(device)
 
-    model.load_encoder_from_classifier(args.classifier_ckpt, device)
+    # Warm-start encoder from classifier checkpoint
+    if Path(args.classifier_ckpt).exists():
+        cls_state = torch.load(args.classifier_ckpt, map_location=device)
+        enc_state = {k.replace("encoder.", "", 1): v
+                     for k, v in cls_state.items() if k.startswith("encoder.")}
+        model.encoder.load_state_dict(enc_state, strict=False)
+        print(f"  Warm-started encoder from {args.classifier_ckpt}")
 
-
-    optimizer = optim.AdamW([
-        {'params': model.encoder.parameters(), 'lr': args.phase2_lr * 0.1},
-        {'params': list(model.bottleneck.parameters()) +
-                   list(model.dec5.parameters()) +
-                   list(model.dec4.parameters()) +
-                   list(model.dec3.parameters()) +
-                   list(model.dec2.parameters()) +
-                   list(model.dec1.parameters()) +
-                   list(model.final_conv.parameters()),
-         'lr': args.phase2_lr},
-    ], weight_decay=args.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
+                             weight_decay=args.weight_decay)
 
     if args.no_resume:
-        start_epoch, best_metric = 1, 0.0
+        start_epoch, best_metric = 1, float("inf")
         print("  --no_resume: starting fresh.")
     else:
         start_epoch, best_metric, _ = load_resume_checkpoint(
             model, optimizer, args.unet_ckpt, device)
         if best_metric is None:
-            best_metric = 0.0
+            best_metric = float("inf")
 
-    class_weights = torch.tensor([2.0, 1.0, 0.0], device=device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=2)
+    # CrossEntropyLoss: per-pixel multi-class classification loss.
+    # Oxford-IIIT Pet trimaps have 3 classes (fg/bg/boundary).
+    # CE applies softmax + NLL per pixel; standard and well-justified choice.
+    criterion = nn.CrossEntropyLoss()
 
-    total_epochs = args.epochs
+    def pixel_accuracy(logits, masks):
+        return (logits.argmax(dim=1) == masks).float().mean().item()
 
     if args.use_wandb and WANDB_AVAILABLE:
         wandb.init(project=args.wandb_project, config=vars(args),
-                   name="vgg11_unet", resume="allow")
+                   name="vgg11_segmentation", resume="allow")
 
     for epoch in range(start_epoch, args.epochs + 1):
-        lr_dec = cosine_lr(epoch - 1, warmup=args.warmup_epochs,
-                           total=total_epochs, peak=args.phase2_lr)
-        lr_enc = lr_dec * 0.1
-        optimizer.param_groups[0]['lr'] = lr_enc
-        optimizer.param_groups[1]['lr'] = lr_dec
+        lr = cosine_lr(epoch - 1, warmup=args.warmup_epochs,
+                       total=args.epochs, peak=args.lr)
+        set_lr(optimizer, lr)
 
+        # ── Train ────────────────────────────────────────────────────────────
         model.train()
-        tr_loss = tr_acc = tr_miou = 0.0
+        tr_loss = tr_acc = 0.0
         t0 = time.time()
 
         for imgs, masks in train_loader:
             imgs, masks = imgs.to(device), masks.to(device)
             optimizer.zero_grad()
-            logits = model(imgs)                    
-            loss   = criterion(logits, masks)
+            logits = model(imgs)                    # [B, 3, H, W]
+            loss = criterion(logits, masks)         # masks: [B, H, W] long
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 2.0)
             optimizer.step()
             tr_loss += loss.item()
-            with torch.no_grad():
-                tr_acc  += pixel_accuracy(logits, masks)
-                tr_miou += mean_iou_seg(logits, masks)
+            tr_acc  += pixel_accuracy(logits.detach(), masks)
 
-        n = len(train_loader)
-        tr_loss /= n; tr_acc /= n; tr_miou /= n
+        tr_loss /= len(train_loader)
+        tr_acc  /= len(train_loader)
 
-      
+        # ── Validate ─────────────────────────────────────────────────────────
         model.eval()
-        va_loss = va_acc = va_miou = 0.0
+        va_loss = va_acc = 0.0
 
         with torch.no_grad():
             for imgs, masks in val_loader:
                 imgs, masks = imgs.to(device), masks.to(device)
                 logits = model(imgs)
-                va_loss  += criterion(logits, masks).item()
-                va_acc   += pixel_accuracy(logits, masks)
-                va_miou  += mean_iou_seg(logits, masks)
+                va_loss += criterion(logits, masks).item()
+                va_acc  += pixel_accuracy(logits, masks)
 
-        n = len(val_loader)
-        va_loss /= n; va_acc /= n; va_miou /= n
+        va_loss /= len(val_loader)
+        va_acc  /= len(val_loader)
 
-        print(
-            f"Epoch [{epoch:03d}/{args.epochs}] "
-            f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.4f}  train_mIoU={tr_miou:.4f}  "
-            f"val_loss={va_loss:.4f}  val_acc={va_acc:.4f}  val_mIoU={va_miou:.4f}  "
-            f"lr_dec={lr_dec:.2e}  time={time.time()-t0:.1f}s"
-        )
+        print(f"Epoch [{epoch:03d}/{args.epochs}] "
+              f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.4f}  "
+              f"val_loss={va_loss:.4f}  val_acc={va_acc:.4f}  "
+              f"lr={lr:.2e}  time={time.time()-t0:.1f}s")
 
         if args.use_wandb and WANDB_AVAILABLE:
             wandb.log({"epoch": epoch,
-                       "train/loss": tr_loss, "train/acc": tr_acc, "train/mIoU": tr_miou,
-                       "val/loss": va_loss,   "val/acc": va_acc,   "val/mIoU": va_miou,
-                       "lr_decoder": lr_dec,  "lr_encoder": lr_enc})
+                       "train/loss": tr_loss, "train/acc": tr_acc,
+                       "val/loss": va_loss, "val/acc": va_acc, "lr": lr})
 
-        if va_miou > best_metric:
-            best_metric = va_miou
+        if va_loss < best_metric:
+            best_metric = va_loss
             save_best_checkpoint(model, args.unet_ckpt)
         save_resume_checkpoint(model, optimizer, epoch, best_metric,
-                                2, args.unet_ckpt)
+                                1, args.unet_ckpt)
 
-    print(f"\nBest val mIoU : {best_metric:.4f}")
+    print(f"\nBest val loss : {best_metric:.4f}")
     if args.use_wandb and WANDB_AVAILABLE:
         wandb.finish()
-
-def pixel_accuracy(pred_logits: torch.Tensor, targets: torch.Tensor) -> float:
-    """Fraction of correctly classified pixels (excluding class 2 = boundary)."""
-    preds = pred_logits.argmax(dim=1)         
-    mask  = targets != 2                         
-    return (preds[mask] == targets[mask]).float().mean().item()
-
-
-def mean_iou_seg(pred_logits: torch.Tensor, targets: torch.Tensor,
-                 num_classes: int = 3) -> float:
-    """Mean IoU over foreground (0) and background (1) classes only.
-    Boundary class (2) is excluded from the mean."""
-    preds = pred_logits.argmax(dim=1)
-    ious = []
-    for c in range(num_classes - 1):   
-        pred_c   = preds   == c
-        target_c = targets == c
-        inter = (pred_c & target_c).sum().item()
-        union = (pred_c | target_c).sum().item()
-        if union > 0:
-            ious.append(inter / union)
-    return sum(ious) / len(ious) if ious else 0.0
-
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="DA6401 A2 -- Training")
     p.add_argument("--task", default="classification",
                    choices=["classification", "localization", "segmentation"])
     p.add_argument("--data_root", required=True)
+    # Model
     p.add_argument("--num_classes",   type=int,   default=37)
     p.add_argument("--dropout_p",     type=float, default=0.6)
+    # Training schedule
     p.add_argument("--epochs",        type=int,   default=100)
     p.add_argument("--batch_size",    type=int,   default=32)
     p.add_argument("--lr",            type=float, default=1e-4,
                    help="Phase 1 peak LR (frozen backbone)")
     p.add_argument("--phase2_lr",     type=float, default=3e-4,
-                   help="Head LR for localization (independent cosine / plateau)")
-    p.add_argument("--encoder_lr",    type=float, default=1e-5,
-                   help="LR for partially unfrozen encoder blocks (much lower than head)")
+                   help="Phase 2 peak LR (unfrozen, independent cosine)")
     p.add_argument("--weight_decay",  type=float, default=5e-4)
-    p.add_argument("--num_workers",    type=int,   default=4)
+    p.add_argument("--num_workers",   type=int,   default=4)
     p.add_argument("--warmup_epochs", type=int,   default=2)
     p.add_argument("--freeze_blocks", type=int,   default=4)
     p.add_argument("--unfreeze_epoch",type=int,   default=10)
-    p.add_argument("--mse_weight",    type=float, default=0.5)
-    p.add_argument("--iou_weight",    type=float, default=0.5)
-    p.add_argument("--seg_batch_size",type=int,   default=16)
+    # Localization loss weights
+    p.add_argument("--mse_weight",    type=float, default=0.5,
+                   help="Weight for MSE term in localization loss")
+    p.add_argument("--iou_weight",    type=float, default=0.5,
+                   help="Weight for IoU loss term in localization loss")
+    # Resume control
     p.add_argument("--no_resume",     action="store_true")
+    # Checkpoints
     p.add_argument("--classifier_ckpt", default="checkpoints/classifier.pth")
     p.add_argument("--localizer_ckpt",  default="checkpoints/localizer.pth")
     p.add_argument("--unet_ckpt",       default="checkpoints/unet.pth")
+    # W&B
     p.add_argument("--use_wandb",     action="store_true")
     p.add_argument("--wandb_project", default="da6401_a2")
     return p.parse_args()
@@ -545,76 +544,3 @@ if __name__ == "__main__":
         train_localization(args)
     elif args.task == "segmentation":
         train_segmentation(args)
-    else:
-        raise NotImplementedError(f"Task '{args.task}' not yet implemented.")
-
-
-class DiceLoss(nn.Module):
-    """Soft Dice loss for multi-class segmentation.
-
-    Dice = 2 * |P ∩ T| / (|P| + |T|)
-    Loss = 1 - mean_over_classes(Dice)
-
-    Computed on softmax probabilities (not logits directly).
-    The boundary class (index 2 in Oxford Pets trimaps) is excluded
-    by only averaging over the foreground and background classes.
-    """
-
-    def __init__(self, num_classes: int = 3,
-                 ignore_index: int = 2, eps: float = 1e-6):
-        super().__init__()
-        self.num_classes  = num_classes
-        self.ignore_index = ignore_index
-        self.eps = eps
-
-    def forward(self, logits: torch.Tensor,
-                targets: torch.Tensor) -> torch.Tensor:
-        """
-        logits:  [B, C, H, W]  raw logits
-        targets: [B, H, W]     integer class labels
-        """
-        probs = torch.softmax(logits, dim=1)  
-        B, C, H, W = probs.shape
-
-        target_one_hot = torch.zeros_like(probs)
-        t_clamped = targets.clone()
-        t_clamped[t_clamped == self.ignore_index] = 0
-        target_one_hot.scatter_(1, t_clamped.unsqueeze(1), 1.0)
-
-        mask = (targets != self.ignore_index).float()  
-        mask = mask.unsqueeze(1)                   
-
-        dice_sum = 0.0
-        n_classes = 0
-        for c in range(C):
-            if c == self.ignore_index:
-                continue
-            p = probs[:, c] * mask.squeeze(1)          
-            t = target_one_hot[:, c] * mask.squeeze(1)  
-            inter = (p * t).sum(dim=(1, 2))              
-            denom = p.sum(dim=(1, 2)) + t.sum(dim=(1, 2))  
-            dice  = (2 * inter + self.eps) / (denom + self.eps)
-            dice_sum += dice.mean()
-            n_classes += 1
-
-        return 1.0 - dice_sum / max(n_classes, 1)
-
-
-def mean_iou_seg(logits: torch.Tensor, targets: torch.Tensor,
-                 num_classes: int = 3, ignore_index: int = 2) -> float:
-    """Compute mean IoU over foreground and background classes."""
-    preds = logits.argmax(dim=1) 
-    iou_sum, n = 0.0, 0
-    for c in range(num_classes):
-        if c == ignore_index:
-            continue
-        mask = (targets != ignore_index)
-        p = (preds  == c) & mask
-        t = (targets == c) & mask
-        inter = (p & t).sum().item()
-        union = (p | t).sum().item()
-        if union > 0:
-            iou_sum += inter / union
-            n += 1
-    return iou_sum / max(n, 1)
-
